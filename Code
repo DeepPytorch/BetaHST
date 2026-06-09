@@ -1,0 +1,226 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class MoEBlock(nn.Module):
+    """A simple Mixture-of-Experts feed-forward block."""
+    def __init__(self, dim, expert_count=4, expert_hidden=2048*64):
+        super().__init__()
+        self.expert_count = expert_count
+        self.experts = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(dim, expert_hidden),
+                nn.ReLU(),
+                nn.Linear(expert_hidden, dim)
+            ) for _ in range(expert_count)
+        ])
+        self.gate = nn.Linear(dim, expert_count)
+
+    def forward(self, x):
+        is_batched = x.dim() == 3
+        if not is_batched:
+            x = x.unsqueeze(1)
+        
+        gates = self.gate(x)
+        k = min(2, self.expert_count)
+        topk_vals, topk_idx = torch.topk(gates, k, dim=-1)
+        topk_weights = F.softmax(topk_vals, dim=-1)
+        
+        out = torch.zeros_like(x)
+        for i, expert in enumerate(self.experts):
+            mask = (topk_idx == i).any(dim=-1)
+            if not mask.any():
+                continue
+            
+            tokens = x[mask]
+            expert_out = expert(tokens)
+            
+            idx_mask = (topk_idx[mask] == i)
+            weights = (idx_mask * topk_weights[mask]).sum(dim=-1, keepdim=True)
+            
+            out[mask] += expert_out * weights
+
+        return out.squeeze(1) if not is_batched else out
+
+
+class TransformerBlock(nn.Module):
+    """A minimal transformer block with self-attention and MoE FFN."""
+    def __init__(self, dim, nhead=4, expert_count=256, expert_hidden=2048*64):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(dim, nhead, batch_first=True)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.moe = MoEBlock(dim, expert_count=expert_count, expert_hidden=expert_hidden)
+
+    def forward(self, x):
+        attn_out, _ = self.attn(x, x, x, need_weights=False)
+        x = self.norm1(x + attn_out)
+        ffn_out = self.moe(x)
+        x = self.norm2(x + ffn_out)
+        return x
+
+class DQN(nn.Module):
+    def __init__(self, input_dim=1, hidden=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, 2)
+        )
+    def forward(self, x):
+        return self.net(x)
+
+
+class AlphaRDT(nn.Module):
+    """A sequential model with a dynamic looped transformer and improved header."""
+    def __init__(
+        self,
+        vocab_size,
+        model_dim,
+        nhead=4,
+        expert_count=4,
+        expert_hidden=2048,
+        max_seq_len=512,
+        min_depth=2,
+        max_depth=25,
+    ):
+        super().__init__()
+        self.max_seq_len = max_seq_len
+        self.min_depth = min_depth
+        self.max_depth = max_depth
+        self.depth_choices = max_depth - min_depth + 1
+
+        self.token_emb = nn.Embedding(vocab_size, model_dim)
+        self.pos_emb = nn.Embedding(max_seq_len, model_dim)
+        
+        self.header = nn.Sequential(
+            nn.Linear(model_dim, model_dim),
+            nn.GELU(),
+            nn.LayerNorm(model_dim),
+            nn.Linear(model_dim, model_dim),
+            nn.GELU(),
+        )
+        
+        self.loop_block = TransformerBlock(
+            model_dim,
+            nhead=nhead,
+            expert_count=expert_count,
+            expert_hidden=expert_hidden,
+        )
+        self.depth_gate = nn.Linear(model_dim, self.depth_choices)
+        self.output_norm = nn.LayerNorm(model_dim)
+        
+        self.tail = nn.Sequential(
+            nn.Linear(model_dim, model_dim),
+            nn.GELU(),
+            nn.Linear(model_dim, vocab_size),
+        )
+
+    def forward(self, x):
+        """Forward with dynamic loop depth between min_depth and max_depth."""
+        B, T = x.shape
+        if T > self.max_seq_len:
+            raise ValueError(f"Sequence length {T} exceeds max_seq_len={self.max_seq_len}")
+
+        x = self.token_emb(x)
+        x = self.header(x)
+        pos = torch.arange(T, device=x.device).unsqueeze(0).expand(B, T)
+        x = x + self.pos_emb(pos)
+
+        pooled = x.mean(dim=1)
+        depth_logits = self.depth_gate(pooled)
+        depth_probs = F.softmax(depth_logits, dim=-1)
+
+        final_x = torch.zeros_like(x)
+        
+        for _ in range(self.min_depth):
+            x = self.loop_block(x)
+            
+        for d in range(self.depth_choices):
+            prob = depth_probs[:, d].view(B, 1, 1)
+            final_x = final_x + x * prob
+            if d < self.depth_choices - 1:
+                x = self.loop_block(x)
+
+        final_x = self.output_norm(final_x)
+        logits = self.tail(final_x)
+        return logits, final_x
+
+
+if __name__ == '__main__':
+    '''
+    Minimal smoke test to verify the model can process input and produce output of expected shape.
+    This model would be trained on the CommonCrawl dataset, HOWEVER in a real envirment it would be trainined on a large
+    350 Trillion tokens+ dataset, but here we just check the forward pass with random data.
+    The model has three main blocks, the input block which has unique weights that the model goes through once,
+    the loop block which has shared weights that the model goes through a variable number of times, 
+    and the output block which also has unique weights that the model goes through once.
+    The output block is by far the most important becuase Recurrent Depth Transformers are extremely unstable
+    and will often hallucinate becuase it will repeatedly apply the same weights in the loop block,
+    so the output block is designed fix the output and check for errors, or in other words to stabilize it.
+    '''
+    training = torch.randint(0, 8192, (4, 8))
+    testing = torch.randint(0, 8192, (2, 8))
+    training_targets = torch.randint(0, 8192, (4, 8))
+    testing_targets = torch.randint(0, 8192, (2, 8))
+    
+
+    '''
+    Actual run would be on a much larger model and dataset, but here we just check the forward pass with random data.
+    This is an actual run code
+    model = AlphaRDT(
+        vocab_size=512000,
+        model_dim=32768,
+        nhead=128,
+        expert_count=1400,
+        expert_hidden=131072
+    )
+    '''
+    VOCAB = 8192
+    model = AlphaRDT(
+        vocab_size=VOCAB,
+        model_dim=256,
+        nhead=16,
+        expert_count=8,
+        expert_hidden=4096
+    )
+
+    dqn = DQN(input_dim=1, hidden=128)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=5, eta_min=1e-5)
+    criterion = nn.CrossEntropyLoss()
+
+    model.train()
+    for epoch in range(5):
+        optimizer.zero_grad()
+        out, hidden = model(training)
+
+        loss_ce = criterion(out.view(-1, VOCAB), training_targets.view(-1))
+
+        with torch.no_grad():
+            flat = hidden.view(-1)
+            total_neurons = flat.numel()
+            sample_count = max(1, int(total_neurons * 0.01))
+            idx = torch.randperm(total_neurons)[:sample_count]
+            sampled = flat[idx].unsqueeze(1)
+            probs = F.softmax(dqn(sampled), dim=-1)
+            unallprob = probs[:, 1].mean()
+
+        if unallprob.item() > 0.5:
+            total_loss = ((unallprob * (1 / 0.5))**2 + loss_ce) / 2
+        else:
+            total_loss = loss_ce
+
+        total_loss.backward()
+        optimizer.step()
+        scheduler.step()
+        print(f"Epoch {epoch} Loss: {total_loss.item()} LR: {scheduler.get_last_lr()[0]}")
+
+    model.eval()
+    with torch.no_grad():
+        test_out, _ = model(testing)
+        test_loss = criterion(test_out.view(-1, VOCAB), testing_targets.view(-1))
+        print(f"Test Loss: {test_loss.item()}")
+        print(test_out.shape)
