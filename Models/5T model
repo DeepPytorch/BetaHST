@@ -21,27 +21,40 @@ class MoEBlock(nn.Module):
         is_batched = x.dim() == 3
         if not is_batched:
             x = x.unsqueeze(1)
+            
+        B, T, D = x.shape
+        x_flat = x.view(-1, D)
         
-        gates = self.gate(x)
+        gates = self.gate(x_flat)
         k = min(2, self.expert_count)
+        
         topk_vals, topk_idx = torch.topk(gates, k, dim=-1)
         topk_weights = F.softmax(topk_vals, dim=-1)
         
-        out = torch.zeros_like(x)
+        out_flat = torch.zeros_like(x_flat)
+        
+        # Auxiliary load balancing metrics
+        router_probs = F.softmax(gates, dim=-1)
+        P_i = router_probs.mean(dim=0)
+        mask_1hot = F.one_hot(topk_idx, num_classes=self.expert_count).sum(dim=1).float()
+        f_i = mask_1hot.mean(dim=0)
+        aux_loss = self.expert_count * torch.sum(P_i * f_i)
+        
         for i, expert in enumerate(self.experts):
             mask = (topk_idx == i).any(dim=-1)
             if not mask.any():
                 continue
             
-            tokens = x[mask]
+            tokens = x_flat[mask]
             expert_out = expert(tokens)
             
             idx_mask = (topk_idx[mask] == i)
             weights = (idx_mask * topk_weights[mask]).sum(dim=-1, keepdim=True)
             
-            out[mask] += expert_out * weights
+            out_flat[mask] += expert_out * weights
 
-        return out.squeeze(1) if not is_batched else out
+        out = out_flat.view(B, T, D)
+        return (out.squeeze(1) if not is_batched else out), aux_loss
 
 
 class TransformerBlock(nn.Module):
@@ -53,18 +66,31 @@ class TransformerBlock(nn.Module):
         self.norm2 = nn.LayerNorm(dim)
         self.moe = MoEBlock(dim, expert_count=expert_count, expert_hidden=expert_hidden)
 
-    def forward(self, x):
-        attn_out, _ = self.attn(x, x, x, need_weights=False)
+    def forward(self, x, is_causal=True):
+        T = x.size(1)
+        
+        # Autoregressive causal mask
+        if is_causal:
+            attn_mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        else:
+            attn_mask = None
+            
+        attn_out, _ = self.attn(x, x, x, attn_mask=attn_mask, need_weights=False)
         x = self.norm1(x + attn_out)
-        ffn_out = self.moe(x)
+        
+        # Feed-forward processing with load tracking
+        ffn_out, aux_loss = self.moe(x)
         x = self.norm2(x + ffn_out)
-        return x
+        return x, aux_loss
+
 
 class DQN(nn.Module):
-    def __init__(self, input_dim=1, hidden=64):
+    def __init__(self, input_dim=256, hidden=128):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
             nn.ReLU(),
             nn.Linear(hidden, 2)
         )
@@ -72,7 +98,7 @@ class DQN(nn.Module):
         return self.net(x)
 
 
-class AlphaRDT(nn.Module):
+class BetaHST(nn.Module):
     """A sequential model with a dynamic looped transformer and improved header."""
     def __init__(
         self,
@@ -102,12 +128,17 @@ class AlphaRDT(nn.Module):
             nn.GELU(),
         )
         
-        self.loop_block = TransformerBlock(
-            model_dim,
-            nhead=nhead,
-            expert_count=expert_count,
-            expert_hidden=expert_hidden,
-        )
+        # Sequential unshared layer instantiations
+        total_layers = self.min_depth + self.depth_choices
+        self.layers = nn.ModuleList([
+            TransformerBlock(
+                model_dim,
+                nhead=nhead,
+                expert_count=expert_count,
+                expert_hidden=expert_hidden,
+            ) for _ in range(total_layers)
+        ])
+        
         self.depth_gate = nn.Linear(model_dim, self.depth_choices)
         self.output_norm = nn.LayerNorm(model_dim)
         
@@ -133,60 +164,56 @@ class AlphaRDT(nn.Module):
         depth_probs = F.softmax(depth_logits, dim=-1)
 
         final_x = torch.zeros_like(x)
+        total_aux_loss = 0.0
+        layer_idx = 0
         
+        # Internal layer-by-layer tracking allocations
+        intermediate_states = []
+        
+        # Layer execution and loss aggregation
         for _ in range(self.min_depth):
-            x = self.loop_block(x)
+            x, aux_loss = self.layers[layer_idx](x, is_causal=True)
+            total_aux_loss += aux_loss
+            layer_idx += 1
+        intermediate_states.append(x)
             
         for d in range(self.depth_choices):
             prob = depth_probs[:, d].view(B, 1, 1)
             final_x = final_x + x * prob
             if d < self.depth_choices - 1:
-                x = self.loop_block(x)
+                x, aux_loss = self.layers[layer_idx](x, is_causal=True)
+                total_aux_loss += aux_loss
+                layer_idx += 1
+                if d % max(1, self.depth_choices // 3) == 0:
+                    intermediate_states.append(x)
 
         final_x = self.output_norm(final_x)
         logits = self.tail(final_x)
-        return logits, final_x
+        return logits, final_x, total_aux_loss, intermediate_states
 
 
 if __name__ == '__main__':
-    '''
-    Minimal smoke test to verify the model can process input and produce output of expected shape.
-    This model would be trained on the CommonCrawl dataset, HOWEVER in a real envirment it would be trainined on a large
-    350 Trillion tokens+ dataset, but here we just check the forward pass with random data.
-    The model has three main blocks, the input block which has unique weights that the model goes through once,
-    the loop block which has shared weights that the model goes through a variable number of times, 
-    and the output block which also has unique weights that the model goes through once.
-    The output block is by far the most important becuase Recurrent Depth Transformers are extremely unstable
-    and will often hallucinate becuase it will repeatedly apply the same weights in the loop block,
-    so the output block is designed fix the output and check for errors, or in other words to stabilize it.
-    '''
-    training = torch.randint(0, 8192, (4, 8))
-    testing = torch.randint(0, 8192, (2, 8))
-    training_targets = torch.randint(0, 8192, (4, 8))
-    testing_targets = torch.randint(0, 8192, (2, 8))
+
+    training = torch.randint(0, 512000, (4, 8))
+    testing = torch.randint(0, 512000, (2, 8))
+    training_targets = torch.randint(0, 512000, (4, 8))
+    testing_targets = torch.randint(0, 512000, (2, 8))
     
+    model_dim = 16384
+    VOCAB = 512000
 
-    '''
-    Actual run would be on a much larger model and dataset, but here we just check the forward pass with random data.
-    This is an actual run code
-    model = AlphaRDT(
+    # Approximate 5T parameter configuration
+    model = BetaHST(
         vocab_size=512000,
-        model_dim=32768,
+        model_dim=16384,
         nhead=128,
-        expert_count=1400,
-        expert_hidden=131072
-    )
-    '''
-    VOCAB = 8192
-    model = AlphaRDT(
-        vocab_size=VOCAB,
-        model_dim=256,
-        nhead=16,
-        expert_count=8,
-        expert_hidden=4096
+        expert_count=16,
+        expert_hidden=65536,
+        min_depth=5,
+        max_depth=149
     )
 
-    dqn = DQN(input_dim=1, hidden=128)
+    dqn = DQN(input_dim=model_dim, hidden=16384)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=5, eta_min=1e-5)
@@ -195,32 +222,42 @@ if __name__ == '__main__':
     model.train()
     for epoch in range(5):
         optimizer.zero_grad()
-        out, hidden = model(training)
+        out, hidden, aux_loss, stages = model(training)
 
         loss_ce = criterion(out.view(-1, VOCAB), training_targets.view(-1))
 
-        with torch.no_grad():
-            flat = hidden.view(-1)
-            total_neurons = flat.numel()
-            sample_count = max(1, int(total_neurons * 0.01))
-            idx = torch.randperm(total_neurons)[:sample_count]
-            sampled = flat[idx].unsqueeze(1)
-            probs = F.softmax(dqn(sampled), dim=-1)
-            unallprob = probs[:, 1].mean()
+        # Context evaluation subset selection
+        all_sampled_states = []
+        for stage_tensor in stages + [hidden]:
+            B, T, D = stage_tensor.shape
+            flat_tokens = stage_tensor.view(-1, D)
+            total_tokens = flat_tokens.size(0)
+            
+            sample_count = max(1, int(total_tokens * 0.01))
+            idx = torch.randperm(total_tokens)[:sample_count]
+            all_sampled_states.append(flat_tokens[idx])
+        
+        combined_samples = torch.cat(all_sampled_states, dim=0)
+        probs = F.softmax(dqn(combined_samples), dim=-1)
+        
+        # Absolute structural misgating extraction penalization
+        unallprob = probs[:, 1].max()
 
-        if unallprob.item() > 0.5:
-            total_loss = ((unallprob * (1 / 0.5))**2 + loss_ce) / 2
+        threshold = 0.5
+        # variable unallprob is the softmax output of the DQN
+        if unallprob.item() > threshold:
+            total_loss = ((unallprob * (1 / threshold))**2 + loss_ce + aux_loss) / 2
         else:
-            total_loss = loss_ce
+            total_loss = loss_ce + aux_loss
 
         total_loss.backward()
         optimizer.step()
         scheduler.step()
-        print(f"Epoch {epoch} Loss: {total_loss.item()} LR: {scheduler.get_last_lr()[0]}")
+        print(f"Epoch {epoch} Loss: {total_loss.item():.4f} LR: {scheduler.get_last_lr()[0]:.6f}")
 
     model.eval()
     with torch.no_grad():
-        test_out, _ = model(testing)
+        test_out, _, _, _ = model(testing)
         test_loss = criterion(test_out.view(-1, VOCAB), testing_targets.view(-1))
-        print(f"Test Loss: {test_loss.item()}")
+        print(f"Test Loss: {test_loss.item():.4f}")
         print(test_out.shape)
